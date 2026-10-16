@@ -1,12 +1,13 @@
 name: Versions legeres Excellence
 
 # Fabrique la version légère (AAC mono 48 kbit/s) de chaque épisode d'Excellence Podcast
-# et la dépose sur excellence.agence-adax.com. Rien à faire : il passe tout seul 4 fois par jour.
+# et la dépose sur excellence.agence-adax.com. Rien à faire : il vérifie tout seul toutes les 15 minutes
+# (moins de 30 secondes quand il n'y a rien de nouveau).
 # Pour le lancer tout de suite : onglet Actions, « Versions legeres Excellence », bouton « Run workflow ».
 
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -23,18 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Installer le convertisseur
-        run: |
-          which ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
-          ffmpeg -hide_banner -version | head -1
-
       - name: Convertir et deposer les episodes
         env:
           CLE_EXCELLENCE: ${{ secrets.CLE_EXCELLENCE }}
           SITE: https://excellence.agence-adax.com
         run: |
           cat > robot.py <<'PY'
-          import json, os, subprocess, sys, time, urllib.request, urllib.parse
+          import http.client, json, os, shutil, subprocess, sys, time, urllib.request, urllib.parse
 
           SITE = os.environ["SITE"].rstrip("/")
           JETON = os.environ.get("CLE_EXCELLENCE", "").strip()
@@ -43,31 +39,53 @@ jobs:
           UA = {"User-Agent": "ExcellencePodcast-Robot/1 (+https://excellence.agence-adax.com)"}
           DEBUT = time.time()
 
-          def appel(params, corps=None, essais=4):
-              url = SITE + "/app-leger.php?" + urllib.parse.urlencode(dict(params, jeton=JETON))
+          # une seule connexion gardée ouverte : le site n'accepte que de petits envois (environ 90 Ko)
+          U = urllib.parse.urlsplit(SITE)
+          CNX = [None]
+          def connexion():
+              if CNX[0] is None:
+                  C = http.client.HTTPSConnection if U.scheme == "https" else http.client.HTTPConnection
+                  CNX[0] = C(U.netloc, timeout=120)
+              return CNX[0]
+
+          def appel(params, corps=None, essais=5):
+              chemin = (U.path or "") + "/app-leger.php?" + urllib.parse.urlencode(dict(params, jeton=JETON))
+              d = {"ok": False, "erreur": "pas de réponse"}
               for n in range(essais):
                   try:
-                      req = urllib.request.Request(url, data=corps, headers=dict(UA, **({"Content-Type": "application/octet-stream"} if corps is not None else {})), method="POST" if corps is not None else "GET")
-                      with urllib.request.urlopen(req, timeout=180) as r:
-                          return json.loads(r.read().decode("utf-8"))
-                  except urllib.error.HTTPError as e:
-                      txt = e.read().decode("utf-8", "replace")
+                      c = connexion()
+                      h = dict(UA)
+                      if corps is not None:
+                          h["Content-Type"] = "application/octet-stream"
+                      c.request("POST" if corps is not None else "GET", chemin, body=corps, headers=h)
+                      r = c.getresponse()
+                      txt = r.read().decode("utf-8", "replace")
                       try:
                           d = json.loads(txt)
                       except Exception:
-                          d = {"ok": False, "erreur": "HTTP %s" % e.code}
-                      if e.code in (400, 404, 409, 413):
+                          d = {"ok": False, "erreur": "HTTP %s" % r.status}
+                      if r.status < 500:
                           return d
                   except Exception as e:
                       d = {"ok": False, "erreur": str(e)}
-                  time.sleep(5 * (n + 1))
+                      try:
+                          CNX[0].close()
+                      except Exception:
+                          pass
+                      CNX[0] = None
+                  time.sleep(3 * (n + 1))
               return d
 
           liste = appel({"a_faire": 1})
           if not liste.get("ok"):
               sys.exit("Le site ne répond pas correctement : %s (vérifier le secret CLE_EXCELLENCE)" % liste)
           a_faire = liste.get("a_faire", [])
-          morceau = int(liste.get("morceau_max", 4 * 1024 * 1024))
+          if not a_faire:
+              print("Rien de nouveau : %s / %s épisodes en version légère." % (liste.get("prets"), liste.get("episodes_audio")))
+              sys.exit(0)
+          if not shutil.which("ffmpeg"):
+              subprocess.run("sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null", shell=True, check=True)
+          morceau = int(liste.get("morceau_max", 90 * 1024))
           print("Déjà prêts : %s / %s · à convertir : %d" % (liste.get("prets"), liste.get("episodes_audio"), len(a_faire)))
 
           for num, ep in enumerate(a_faire):
