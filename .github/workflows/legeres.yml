@@ -1,0 +1,131 @@
+name: Versions legeres Excellence
+
+# Fabrique la version légère (AAC mono 48 kbit/s) de chaque épisode d'Excellence Podcast
+# et la dépose sur excellence.agence-adax.com. Rien à faire : il passe tout seul 4 fois par jour.
+# Pour le lancer tout de suite : onglet Actions, « Versions legeres Excellence », bouton « Run workflow ».
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: legeres
+  cancel-in-progress: false
+
+jobs:
+  convertir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer le convertisseur
+        run: |
+          which ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          ffmpeg -hide_banner -version | head -1
+
+      - name: Convertir et deposer les episodes
+        env:
+          CLE_EXCELLENCE: ${{ secrets.CLE_EXCELLENCE }}
+          SITE: https://excellence.agence-adax.com
+        run: |
+          cat > robot.py <<'PY'
+          import json, os, subprocess, sys, time, urllib.request, urllib.parse
+
+          SITE = os.environ["SITE"].rstrip("/")
+          JETON = os.environ.get("CLE_EXCELLENCE", "").strip()
+          if not JETON:
+              sys.exit("Le secret CLE_EXCELLENCE manque (Settings > Secrets and variables > Actions).")
+          UA = {"User-Agent": "ExcellencePodcast-Robot/1 (+https://excellence.agence-adax.com)"}
+          DEBUT = time.time()
+
+          def appel(params, corps=None, essais=4):
+              url = SITE + "/app-leger.php?" + urllib.parse.urlencode(dict(params, jeton=JETON))
+              for n in range(essais):
+                  try:
+                      req = urllib.request.Request(url, data=corps, headers=dict(UA, **({"Content-Type": "application/octet-stream"} if corps is not None else {})), method="POST" if corps is not None else "GET")
+                      with urllib.request.urlopen(req, timeout=180) as r:
+                          return json.loads(r.read().decode("utf-8"))
+                  except urllib.error.HTTPError as e:
+                      txt = e.read().decode("utf-8", "replace")
+                      try:
+                          d = json.loads(txt)
+                      except Exception:
+                          d = {"ok": False, "erreur": "HTTP %s" % e.code}
+                      if e.code in (400, 404, 409, 413):
+                          return d
+                  except Exception as e:
+                      d = {"ok": False, "erreur": str(e)}
+                  time.sleep(5 * (n + 1))
+              return d
+
+          liste = appel({"a_faire": 1})
+          if not liste.get("ok"):
+              sys.exit("Le site ne répond pas correctement : %s (vérifier le secret CLE_EXCELLENCE)" % liste)
+          a_faire = liste.get("a_faire", [])
+          morceau = int(liste.get("morceau_max", 4 * 1024 * 1024))
+          print("Déjà prêts : %s / %s · à convertir : %d" % (liste.get("prets"), liste.get("episodes_audio"), len(a_faire)))
+
+          for num, ep in enumerate(a_faire):
+              if time.time() - DEBUT > 4 * 3600:
+                  print("Temps écoulé, la suite au prochain passage.")
+                  break
+              cle, titre = ep["cle"], ep["titre"]
+              print("\n== %s · %s" % (cle, titre), flush=True)
+              src, sortie = "source-%d.audio" % num, "leger-%d.m4a" % num
+              try:
+                  req = urllib.request.Request(ep["audio"], headers=UA)
+                  with urllib.request.urlopen(req, timeout=120) as r, open(src, "wb") as f:
+                      while True:
+                          b = r.read(1 << 20)
+                          if not b:
+                              break
+                          f.write(b)
+                  if os.path.getsize(src) < 100000:
+                      raise RuntimeError("fichier d'origine trop petit")
+                  t = time.time()
+                  subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "44100",
+                                  "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart", "-f", "mp4", sortie], check=True)
+                  avant, apres = os.path.getsize(src), os.path.getsize(sortie)
+                  print("converti en %.0f s : %.1f Mo -> %.1f Mo" % (time.time() - t, avant / 1048576, apres / 1048576), flush=True)
+                  if apres >= avant:
+                      raise RuntimeError("la version légère n'est pas plus légère")
+                  n = (apres + morceau - 1) // morceau
+                  with open(sortie, "rb") as f:
+                      for i in range(n):
+                          pos = i * morceau
+                          f.seek(pos)
+                          d = appel({"depot": cle, "morceau": i, "total": n, "position": pos, "taille": apres}, f.read(morceau))
+                          if not d.get("ok"):
+                              raise RuntimeError("dépôt refusé au morceau %d : %s" % (i, d.get("erreur")))
+                  print("déposé sur le site (%d morceaux)" % n, flush=True)
+              except Exception as e:
+                  print("ÉCHEC : %s" % e, flush=True)
+                  appel({"echec": cle, "raison": str(e)[:120]}, b"")
+              finally:
+                  for x in (src, sortie):
+                      if os.path.exists(x):
+                          os.remove(x)
+
+          fin = appel({"a_faire": 1})
+          print("\nBilan : %s / %s épisodes en version légère" % (fin.get("prets"), fin.get("episodes_audio")))
+          PY
+          python3 robot.py
+
+      # GitHub met en pause les robots d'un dépôt resté 60 jours sans changement : on note la date une fois par mois.
+      - name: Garder le robot actif
+        if: always()
+        run: |
+          derniere=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - derniere )) -gt 2592000 ]; then
+            date -u +"%Y-%m-%d %H:%M UTC" > dernier-passage.txt
+            git config user.name "robot-excellence"
+            git config user.email "robot-excellence@users.noreply.github.com"
+            git add dernier-passage.txt
+            git commit -m "Robot actif"
+            git push
+          fi
